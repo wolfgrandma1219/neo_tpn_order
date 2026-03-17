@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 
 // === 未來串接 Google Apps Script 的網址請填入此處 ===
-const GAS_URL = "https://script.google.com/macros/s/您的部署ID/exec";
+const GAS_URL = "https://script.google.com/macros/s/AKfycbx2aVUjQ4H8_nNCzPRdj6R-WcTL3cdihfzu1zNAOrjBMxE907p2BETj-eGifozIsqtq/exec";
 
 // --- 初始化模擬資料 (對應未來的 Google Sheets) ---
 const INITIAL_USERS = [
@@ -58,12 +58,36 @@ const OTHER_ADDITIONS = [
 // --- 工具函數 ---
 const generateId = (prefix) => `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 const getAgeInDays = (dob) => {
+  if (!dob) return 0;
   const diffTime = Math.abs(new Date() - new Date(dob));
-  return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+  const days = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+  return isNaN(days) ? 0 : days;
 };
 const getTodayLocal = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+};
+// 新增：處理 Google Apps Script 傳回來的 ISO 日期字串，轉回標準乾淨的 YYYY-MM-DD
+const cleanDateString = (isoString) => {
+  if (!isoString) return '';
+  const d = new Date(isoString);
+  if (isNaN(d.getTime())) return String(isoString).split('T')[0];
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+// 新增：處理 Google Apps Script 傳回來的時間字串，轉回標準乾淨的 HH:mm
+const cleanTimeString = (timeString) => {
+  if (!timeString) return '';
+  const str = String(timeString);
+  // 如果已經是乾淨的 HH:mm (例如 17:00)，直接回傳
+  if (/^\d{1,2}:\d{2}/.test(str)) return str.substring(0, 5);
+  
+  // 若為 Google Sheets 預設的時間格式 (例如 1899-12-30T09:00:00.000Z)
+  const d = new Date(str);
+  if (!isNaN(d.getTime())) {
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+  return str;
 };
 
 export default function App() {
@@ -103,20 +127,19 @@ export default function App() {
   const apiSync = async (action, table, pk, data, successCallback) => {
     setIsSyncing(true);
     try {
-      /* * ====== 未來正式串接 GAS 時，請取消註解這段 ======
-       * const response = await fetch(GAS_URL, {
-       * method: 'POST',
-       * body: JSON.stringify({ action, table, pk, data })
-       * });
-       * const result = await response.json();
-       * if (!result.success) throw new Error(result.error);
-       * ===============================================
-       */
+    // ====== 已經正式串接 GAS ======
+      const response = await fetch(GAS_URL, {
+        method: 'POST',
+        body: JSON.stringify({ action, table, pk, data })
+      });
+      const result = await response.json();
+      if (!result.success) throw new Error(result.error);
+      // ===============================================
       
       // 目前模擬網路延遲 300 毫秒
       await new Promise(resolve => setTimeout(resolve, 300));
       
-      // 如果 API 呼叫成功，才執行本地的畫面更新 (setDb)
+      // 如果 API 呼叫成功，執行本地的畫面更新 (setDb)
       successCallback();
       
     } catch (error) {
@@ -127,13 +150,69 @@ export default function App() {
     }
   };
 
+  // --- 網頁初始載入：從 GAS 抓取真實資料庫 ---
+  useEffect(() => {
+    const fetchAllData = async () => {
+      setIsSyncing(true);
+      try {
+        const response = await fetch(GAS_URL, {
+          method: 'POST',
+          body: JSON.stringify({ action: 'getAllData' })
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+          // 【安全防護】：確保合併 INITIAL_LIMITS 避免 Google Sheet 缺項導致崩潰
+          const fetchedLimits = result.data.limits || {};
+          const safeLimits = Object.keys(fetchedLimits).length > 0 
+            ? { ...INITIAL_LIMITS, ...fetchedLimits } 
+            : INITIAL_LIMITS;
+
+          // 【安全防護】：過濾 Google Sheets 傳來的原始 ISO 日期字串 (例如 2026-03-13T16:00:00.000Z) 轉為前端適用的 YYYY-MM-DD
+          const normalizedPatients = (result.data.patients || []).map(p => ({ ...p, dob: cleanDateString(p.dob) }));
+          const normalizedAdmissions = (result.data.admissions || []).map(a => ({ ...a, adminDate: cleanDateString(a.adminDate), dischargeDate: cleanDateString(a.dischargeDate) }));
+          
+          // 【修正】：同步清洗 startDate 以及 startTime
+          const normalizedOrders = (result.data.orders || []).map(o => ({ 
+            ...o, 
+            startDate: cleanDateString(o.startDate),
+            startTime: cleanTimeString(o.startTime)
+          }));
+
+          setDb({
+            users: result.data.users && result.data.users.length > 0 ? result.data.users : INITIAL_USERS,
+            limits: safeLimits,
+            packages: result.data.packages && result.data.packages.length > 0 ? result.data.packages : INITIAL_PACKAGES,
+            patients: normalizedPatients,
+            admissions: normalizedAdmissions,
+            orders: normalizedOrders
+          });
+        } else {
+          showAlert(`讀取資料庫失敗: ${result.error}`);
+        }
+      } catch (error) {
+        console.error("連線錯誤:", error);
+        showAlert(`無法連線至資料庫: ${error.message}`);
+      } finally {
+        setIsSyncing(false);
+      }
+    };
+
+    fetchAllData();
+  }, []);
+
   // --- 登入處理 ---
   const handleLogin = (username, password) => {
-    const found = db.users.find(u => u.username === username && u.password === password);
+    // 【安全防護】：強制轉型別 String，避免 Google Sheets 的數字密碼導致比對失敗
+    const found = db.users.find(u => 
+      String(u.username) === String(username) && 
+      String(u.password) === String(password)
+    );
+    
     if (found) {
       setUser(found);
       if (found.role === 'admin') setView('settings');
-      else if (found.role === 'pharmacist') setView('globalOrders'); // 藥師直接進入總列表
+      else if (found.role === 'pharmacist') setView('globalOrders');
       else setView('patients');
     } else {
       showAlert('帳號或密碼錯誤');
@@ -221,9 +300,6 @@ function LoginView({ onLogin }) {
             登入系統
           </button>
         </form>
-        <div className="mt-4 text-xs text-gray-500 text-center">
-          測試帳號：admin/123 (設定), dr/123 (開立), ph/123 (調配)
-        </div>
       </div>
     </div>
   );
@@ -234,13 +310,17 @@ function LoginView({ onLogin }) {
 // ==========================================
 function SettingsView({ db, setDb, apiSync, showAlert }) {
   const [newUser, setNewUser] = useState({ username: '', password: '', role: 'doctor', name: '' });
-  
-  // 建立一個本地的 limits 狀態，避免打字時一直觸發 API
   const [localLimits, setLocalLimits] = useState(db.limits);
 
+  // 【關鍵修復】：新增 useEffect 監聽 db.limits 的變化
+  // 當系統從 Google 試算表成功抓取真實資料並更新 db 後，必須同步覆寫設定頁面的 localLimits
+  useEffect(() => {
+    setLocalLimits(db.limits);
+  }, [db.limits]);
+
   const handleSaveLimits = () => {
-    // 使用統一的 API 處理中心打包傳送
-    apiSync('saveRecord', 'limits', null, localLimits, () => {
+    // 【修正】：將 pk 由 null 改為 'element'，以通過 GAS 的 indexOf('element') 檢查
+    apiSync('saveRecord', 'limits', 'element', localLimits, () => {
       setDb(p => ({ ...p, limits: localLimits }));
       showAlert('濃度設定已成功儲存至資料庫！');
     });
@@ -248,7 +328,8 @@ function SettingsView({ db, setDb, apiSync, showAlert }) {
 
   const handleAddUser = () => {
     if (!newUser.username || !newUser.password || !newUser.name) return showAlert('請填寫完整資訊');
-    if (db.users.find(u => u.username === newUser.username)) return showAlert('此帳號已存在');
+    // 強制字串比對防護
+    if (db.users.find(u => String(u.username) === String(newUser.username))) return showAlert('此帳號已存在');
     
     const userToAdd = { id: generateId('u'), ...newUser };
     
@@ -260,12 +341,12 @@ function SettingsView({ db, setDb, apiSync, showAlert }) {
   };
 
   const handleDeleteUser = (id) => {
-    const user = db.users.find(u => u.id === id);
-    if (user.username === 'admin') return showAlert('無法刪除預設管理員帳號');
+    const user = db.users.find(u => String(u.id) === String(id));
+    if (user && user.username === 'admin') return showAlert('無法刪除預設管理員帳號');
     
-    if(confirm(`確定要刪除帳號 ${user.username} 嗎？`)) {
+    if(confirm(`確定要刪除帳號 ${user ? user.username : ''} 嗎？`)) {
       apiSync('deleteRecord', 'users', 'id', { id }, () => {
-        setDb(p => ({...p, users: p.users.filter(u => u.id !== id)}));
+        setDb(p => ({...p, users: p.users.filter(u => String(u.id) !== String(id))}));
         showAlert('帳號已刪除');
       });
     }
@@ -383,15 +464,17 @@ function PatientsView({ db, apiSync, setDb, showAlert, onSelect }) {
   const [showNew, setShowNew] = useState(false);
   const [newPt, setNewPt] = useState({ mrn: '', name: '', dob: '', gender: '男' });
 
-  const filtered = db.patients.filter(p => p.mrn.includes(search) || p.name.includes(search));
+  // 【安全防護】：確保 mrn 與 name 不會因為是數字型態而導致 .includes 崩潰
+  const filtered = db.patients.filter(p => 
+    (p.mrn != null && String(p.mrn).includes(search)) || 
+    (p.name != null && String(p.name).includes(search))
+  );
 
   const handleSave = () => {
     if(newPt.mrn.length < 1 || newPt.mrn.length > 7) return showAlert('病歷號須為7碼內');
-    if(db.patients.find(p => p.mrn === newPt.mrn)) return showAlert('病歷號已存在');
+    if(db.patients.find(p => String(p.mrn) === String(newPt.mrn))) return showAlert('病歷號已存在');
     
-    // 透過 API Sync 處理
     apiSync('saveRecord', 'patients', 'mrn', newPt, () => {
-      // 順利更新本地狀態
       if (setDb) setDb(p => ({ ...p, patients: [...p.patients, newPt] }));
       setShowNew(false);
       setNewPt({ mrn: '', name: '', dob: '', gender: '男' });
@@ -421,7 +504,6 @@ function PatientsView({ db, apiSync, setDb, showAlert, onSelect }) {
               <option>男</option><option>女</option>
             </select>
           </div>
-          {/* 【修正】將 handleSave 替換成包含 API 與本地更新的邏輯 */}
           <button onClick={handleSave} className="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700"><Save size={18}/></button>
           <button onClick={() => setShowNew(false)} className="text-gray-500 px-2">取消</button>
         </div>
@@ -447,9 +529,6 @@ function PatientsView({ db, apiSync, setDb, showAlert, onSelect }) {
   );
 }
 
-// 為了讓 PatientsView, AdmissionsView 等能順利更新本地狀態，我們需要在宣告時把 setDb 傳給它們
-// 在 App 元件內已確保都有傳入
-
 // ==========================================
 // 4. 就醫序號列表畫面
 // ==========================================
@@ -458,14 +537,14 @@ function AdmissionsView({ db, apiSync, setDb, showAlert, patient, onBack, onSele
   const [newAdm, setNewAdm] = useState({ encounterId: '', adminDate: '', dischargeDate: '', bed: '', isClosed: false });
   const [editingAdm, setEditingAdm] = useState(null); 
 
-  const admissions = db.admissions.filter(a => a.mrn === patient.mrn);
+  // 【安全防護】：強制轉字串比對
+  const admissions = db.admissions.filter(a => String(a.mrn) === String(patient.mrn));
 
   const handleSave = () => {
     if(!newAdm.encounterId || !newAdm.adminDate || !newAdm.bed) return showAlert('請填寫必填欄位');
     
     const recordToSave = { ...newAdm, mrn: patient.mrn };
     apiSync('saveRecord', 'admissions', 'encounterId', recordToSave, () => {
-      // API 成功後，更新本地畫面
       if(setDb) setDb(p => ({ ...p, admissions: [...p.admissions, recordToSave] }));
       setShowNew(false);
       setNewAdm({ encounterId: '', adminDate: '', dischargeDate: '', bed: '', isClosed: false });
@@ -478,7 +557,7 @@ function AdmissionsView({ db, apiSync, setDb, showAlert, patient, onBack, onSele
     apiSync('saveRecord', 'admissions', 'encounterId', editingAdm, () => {
       if(setDb) setDb(p => ({
         ...p,
-        admissions: p.admissions.map(a => a.encounterId === editingAdm.encounterId ? editingAdm : a)
+        admissions: p.admissions.map(a => String(a.encounterId) === String(editingAdm.encounterId) ? editingAdm : a)
       }));
       setEditingAdm(null);
     });
@@ -561,7 +640,8 @@ function AdmissionsView({ db, apiSync, setDb, showAlert, patient, onBack, onSele
 // 5. 處方列表畫面
 // ==========================================
 function OrdersView({ db, apiSync, setDb, patient, admission, user, onBack, onEdit, showAlert }) {
-  const encounterOrders = db.orders.filter(o => o.encounterId === admission.encounterId);
+  // 【安全防護】：強制轉字串比對
+  const encounterOrders = db.orders.filter(o => String(o.encounterId) === String(admission.encounterId));
   
   // 狀態顏色對應
   const statusColors = {
@@ -587,13 +667,14 @@ function OrdersView({ db, apiSync, setDb, patient, admission, user, onBack, onEd
   const formatDateTime = (isoString) => {
     if (!isoString) return '';
     const d = new Date(isoString);
+    if (isNaN(d.getTime())) return String(isoString);
     return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   };
 
   // 處方開始時間格式化工具：將 YYYY-MM-DD 與 HH:mm 組合為 YYYY/M/D HH:mm
   const formatStartDate = (dateStr, timeStr) => {
     if (!dateStr) return '';
-    const parts = dateStr.split('-');
+    const parts = String(dateStr).split('-'); // 【安全防護】強制轉字串避免 split 報錯
     if (parts.length !== 3) return `${dateStr} ${timeStr || ''}`;
     return `${parts[0]}/${parseInt(parts[1], 10)}/${parseInt(parts[2], 10)} ${timeStr || ''}`;
   };
@@ -675,20 +756,22 @@ function GlobalOrdersView({ db, user, onEdit }) {
 
   // 抓取所有處方，並反查對應的病人與就醫序號
   const sortedOrders = db.orders.map(o => {
-    const admission = db.admissions.find(a => a.encounterId === o.encounterId);
-    const patient = admission ? db.patients.find(p => p.mrn === admission.mrn) : { name: '未知', mrn: '未知' };
+    // 【安全防護】：強制轉字串比對
+    const admission = db.admissions.find(a => String(a.encounterId) === String(o.encounterId));
+    const patient = admission ? db.patients.find(p => String(p.mrn) === String(admission.mrn)) : { name: '未知', mrn: '未知' };
     return { ...o, patient, admission };
   }).sort((a, b) => new Date(b.date) - new Date(a.date));
 
   const formatDateTime = (isoString) => {
     if (!isoString) return '';
     const d = new Date(isoString);
+    if (isNaN(d.getTime())) return String(isoString);
     return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   };
 
   const formatStartDate = (dateStr, timeStr) => {
     if (!dateStr) return '';
-    const parts = dateStr.split('-');
+    const parts = String(dateStr).split('-'); // 【安全防護】
     if (parts.length !== 3) return `${dateStr} ${timeStr || ''}`;
     return `${parts[0]}/${parseInt(parts[1], 10)}/${parseInt(parts[2], 10)} ${timeStr || ''}`;
   };
@@ -817,8 +900,7 @@ function OrderFormView({ db, setDb, apiSync, patient, admission, user, order, on
 
   // 輔助變數
   const ageDays = getAgeInDays(patient.dob);
-  const selectedPkg = db.packages.find(p => p.code === formData.packageCode);
-
+  
   // =====================================
   // 計算邏輯區
   // =====================================
@@ -871,9 +953,11 @@ function OrderFormView({ db, setDb, apiSync, patient, admission, user, order, on
       
       // 只有當使用者"主動選擇"非自訂的標準套裝時，才批次覆寫所有成分濃度
       if (newPkgCode && newPkgCode !== 'C01') {
-        const pkg = db.packages.find(p => p.code === newPkgCode);
+        // 【安全防護】：強制轉字串比對
+        const pkg = db.packages.find(p => String(p.code) === String(newPkgCode));
+        if(!pkg) return newState; // 找不到套餐直接返回
+
         const newElements = { ...prev.elements };
-        
         const volL = prev.calcAdminVol ? prev.calcAdminVol / 1000 : 0;
         const wt = prev.weight ? parseFloat(prev.weight) : 0;
 
@@ -983,7 +1067,8 @@ function OrderFormView({ db, setDb, apiSync, patient, admission, user, order, on
     ELEMENTS.forEach(el => {
       const dose = formData.elements[el.key].dose;
       const limit = db.limits[el.key];
-      if (dose < limit.min || dose > limit.max) {
+      // 如果 limit 未完整定義，則不予阻擋以防白屏，但若有值則進行判斷
+      if (limit && (dose < limit.min || dose > limit.max)) {
         errors[el.key] = `超出範圍 (${limit.min}~${limit.max})`;
       }
     });
@@ -1000,33 +1085,51 @@ function OrderFormView({ db, setDb, apiSync, patient, admission, user, order, on
 
     let finalOrder = { ...formData, status: newStatus, date: new Date().toISOString() };
 
-    // 透過統一 API 存檔
-    apiSync('saveRecord', 'orders', 'orderId', finalOrder, () => {
-      if(setDb) {
-        setDb(prev => {
-          let newOrders = [...prev.orders];
-          
-          // SOP: 如果這次存檔是把 Draft 變成 Submitted，且有 parentOrderId (代表是修改而來的)
-          // 必須把舊版 (parentOrderId) 的狀態改成 Void
-          if (newStatus === 'Submitted' && finalOrder.parentOrderId) {
-            newOrders = newOrders.map(o => 
-              o.orderId === finalOrder.parentOrderId ? { ...o, status: 'Void' } : o
-            );
-          }
+    // 定義儲存新處方與更新畫面的動作
+    const saveNewOrder = () => {
+      apiSync('saveRecord', 'orders', 'orderId', finalOrder, () => {
+        if(setDb) {
+          setDb(prev => {
+            let newOrders = [...prev.orders];
+            
+            // SOP: 更新本地畫面，把舊版 (parentOrderId) 的狀態改成 Void
+            if (newStatus === 'Submitted' && finalOrder.parentOrderId) {
+              newOrders = newOrders.map(o => 
+                String(o.orderId) === String(finalOrder.parentOrderId) ? { ...o, status: 'Void' } : o
+              );
+            }
 
-          // 更新或新增目前這筆
-          const existingIdx = newOrders.findIndex(o => o.orderId === finalOrder.orderId);
-          if (existingIdx >= 0) {
-            newOrders[existingIdx] = finalOrder;
-          } else {
-            newOrders.push(finalOrder);
-          }
+            // 更新或新增目前這筆
+            const existingIdx = newOrders.findIndex(o => String(o.orderId) === String(finalOrder.orderId));
+            if (existingIdx >= 0) {
+              newOrders[existingIdx] = finalOrder;
+            } else {
+              newOrders.push(finalOrder);
+            }
 
-          return { ...prev, orders: newOrders };
+            return { ...prev, orders: newOrders };
+          });
+        }
+        onBack();
+      });
+    };
+
+    // 【修復 Bug】：如果是提交修改後的新版，必須「先通知資料庫把舊版作廢」
+    if (newStatus === 'Submitted' && finalOrder.parentOrderId) {
+      const oldOrder = db.orders.find(o => String(o.orderId) === String(finalOrder.parentOrderId));
+      if (oldOrder) {
+        const voidedOrder = { ...oldOrder, status: 'Void' };
+        // 1. 先透過 API 存舊版為作廢
+        apiSync('saveRecord', 'orders', 'orderId', voidedOrder, () => {
+          // 2. 舊版作廢成功後，再存新版
+          saveNewOrder();
         });
+        return; // 提早返回，讓 callback 接手後續動作
       }
-      onBack();
-    });
+    }
+
+    // 若無舊版需要作廢，直接存新版
+    saveNewOrder();
   };
 
   // SOP: 醫師修改已提交的處方
@@ -1054,7 +1157,7 @@ function OrderFormView({ db, setDb, apiSync, patient, admission, user, order, on
       apiSync('saveRecord', 'orders', 'orderId', deletedOrder, () => {
         if(setDb) setDb(prev => ({
           ...prev,
-          orders: prev.orders.map(o => o.orderId === formData.orderId ? { ...o, status: 'Deleted' } : o)
+          orders: prev.orders.map(o => String(o.orderId) === String(formData.orderId) ? { ...o, status: 'Deleted' } : o)
         }));
         onBack();
       });
